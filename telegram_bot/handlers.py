@@ -9,10 +9,15 @@ from telegram.ext import (
 )
 
 from config import SYSTEM_PROMPT, logger
-from llm.base import LLMClient
 from storage.base import BaseContextStore
 from telegram_bot.utils import split_message
 from telegram_bot.message_adapter import parse_message, to_chat_message
+from llm.base import (
+    LLMClient,
+    LLMError,
+    LLMOverloadedError,
+    LLMQuotaExceededError,
+)
 
 
 def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
@@ -24,7 +29,7 @@ def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         message = update.message
         if message:
-            await message.reply_text("Привет! Я чат-бот, чем могу помочь?")
+            await message.reply_text("Привет! Чем могу помочь?")
 
     async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         user = update.effective_user
@@ -87,11 +92,35 @@ def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
             for chunk in split_message(assistant_response):
                 await message.reply_text(chunk)
 
+        except LLMQuotaExceededError:
+            logger.warning("LLM quota exceeded (Gemini 429) for user %s", user_id)
+            await message.reply_text(
+                "Исчерпан доступный лимит запросов к модели. "
+                "Лимит скоро обновится. Пожалуйста, попробуй ещё раз чуть позже 🙂"
+            )
+
+        except LLMOverloadedError:
+            logger.warning("LLM overloaded (Gemini 503) for user %s", user_id)
+            await message.reply_text(
+                "Сейчас модель перегружена и временно недоступна. "
+                "Пожалуйста, попробуй ещё раз чуть позже 🙂"
+            )
+
+        except LLMError:
+            logger.exception(
+                "LLMError while getting response from LLM for user %s", user_id
+            )
+            await message.reply_text(
+                "Возникла ошибка при обращении к модели. "
+                "Скорее всего проблема на стороне сервиса LLM. "
+                "Пожалуйста, попробуй ещё раз чуть позже 🙂"
+            )
+
         except Exception:
             logger.exception(
-                "Error while getting response from LLM for user %s", user_id
+                "Unexpected error while processing message for user %s", user_id
             )
-            await message.reply_text("Произошла ошибка, попробуйте позже.")
+            await message.reply_text("Произошла непредвиденная ошибка, попробуйте позже.")
 
     return [
         CommandHandler("start", start),
