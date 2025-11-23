@@ -26,6 +26,13 @@ FORMULA_DBL_BLOCK_RE = re.compile(r"^\s*\$\$(.+)\$\$\s*$")
 _PLACEHOLDER_PREFIX = "\u0000P"
 _PLACEHOLDER_SUFFIX = "\u0000"
 
+# Паттерны для сплита
+HR_SPLIT_RE = re.compile(
+    r"^\s*(\\-\\-\\-|\\\*\\\*\\\*|\\_\\_\\_)\s*$"
+)
+CODE_FENCE_LINE_RE = re.compile(r"^(`{3,})(.*)$")
+BOLD_LINE_RE = re.compile(r"^\s*\*.+\*\s*$")
+
 
 def _escape_md_v2(text: str) -> str:
     """
@@ -464,25 +471,390 @@ def convert_to_md_v2(text: str) -> str:
     return "\n".join(out_lines)
 
 
-def split_md_v2(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LEN) -> List[str]:
+def _split_on_horizontal_rules(text: str) -> List[str]:
     """
-    Разбивает длинный текст на части так, чтобы каждая влезала в лимит Telegram.
-    Старается резать по переводам строк или пробелам.
+    Делит текст на секции по строкам-разделителям:
+
+      ---
+      ***
+      ___
+
+    Эти строки в вывод не попадают.
     """
+    lines = text.splitlines(keepends=True)
+    sections: List[str] = []
+    buf: List[str] = []
+
+    for line in lines:
+        if HR_SPLIT_RE.match(line.strip()):
+            if buf:
+                sections.append("".join(buf).rstrip())
+                buf = []
+            # разделитель выкидываем
+            continue
+        buf.append(line)
+
+    if buf:
+        sections.append("".join(buf).rstrip())
+
+    return sections
+
+
+def _parse_blocks(section: str) -> List[Dict[str, str]]:
+    """
+    Разбивает секцию на блоки двух типов:
+      - {"type": "text", "text": "..."}
+      - {"type": "code", "text": "```lang\\n...```"}
+    """
+    lines = section.splitlines(keepends=True)
+    blocks: List[Dict[str, str]] = []
+
+    i = 0
+    n = len(lines)
+
+    while i < n:
+        line = lines[i]
+        stripped = line.lstrip()
+        m = CODE_FENCE_LINE_RE.match(stripped)
+
+        if m:
+            # Блок кода c ```...```
+            opening = lines[i]
+            i += 1
+            body_lines: List[str] = []
+
+            # Собираем до закрывающего ```
+            while i < n:
+                l2 = lines[i]
+                if l2.lstrip().startswith("```"):
+                    closing = l2
+                    i += 1
+                    break
+                body_lines.append(l2)
+                i += 1
+            else:
+                closing = ""
+
+            full_block = opening + "".join(body_lines) + closing
+            blocks.append({"type": "code", "text": full_block})
+        else:
+            # Обычный текстовый блок до ближайшего ``` или конца
+            text_lines = [line]
+            i += 1
+            while i < n and not CODE_FENCE_LINE_RE.match(lines[i].lstrip()):
+                text_lines.append(lines[i])
+                i += 1
+            blocks.append({"type": "text", "text": "".join(text_lines)})
+
+    return blocks
+
+
+def _smart_split_point(text: str, max_len: int) -> int:
+    """
+    Ищет "красивую" позицию разрыва в пределах max_len (для обычного текста).
+
+    Приоритет деления:
+      - по двойным переводам строк (\n\n)
+      - по одиночному переводу строки (\n)
+      - по табуляции (\t)
+      - по точка+пробел (". ")
+      - по пробелу
+      - в противном случае - жёстко режем на max_len
+    """
+    if len(text) <= max_len:
+        return len(text)
+
+    window = text[:max_len]
+
+    # \n\n
+    idx = window.rfind("\n\n")
+    if idx != -1:
+        return idx + 2
+
+    # \n
+    idx = window.rfind("\n")
+    if idx != -1:
+        return idx + 1
+
+    # \t
+    idx = window.rfind("\t")
+    if idx != -1:
+        return idx + 1
+
+    # ". "
+    idx = window.rfind(". ")
+    if idx != -1:
+        return idx + 2
+
+    # пробел
+    idx = window.rfind(" ")
+    if idx != -1:
+        return idx + 1
+
+    # жёсткий разрез
+    return max_len
+
+
+def _smart_split_point_code(text: str, max_len: int) -> int:
+    """
+    "Красивый" разрыв для кода (без точки-пробела).
+    Приоритет:
+      - \n\n
+      - \n
+      - \t
+      - пробел
+      - иначе жёсткий разрез
+    """
+    if len(text) <= max_len:
+        return len(text)
+
+    window = text[:max_len]
+
+    idx = window.rfind("\n\n")
+    if idx != -1:
+        return idx + 2
+
+    idx = window.rfind("\n")
+    if idx != -1:
+        return idx + 1
+
+    idx = window.rfind("\t")
+    if idx != -1:
+        return idx + 1
+
+    idx = window.rfind(" ")
+    if idx != -1:
+        return idx + 1
+
+    return max_len
+
+
+def _split_long_code_block(block_text: str, limit: int) -> List[str]:
+    """
+    Делит один кодовый блок (с уже расставленными ```...```) на несколько
+    самостоятельных код-блоков, если он сам по себе превышает limit.
+
+    Каждый кусок будет иметь свои собственные:
+      ```lang
+      ...часть кода...
+      ```
+    """
+    lines = block_text.splitlines(keepends=True)
+    if not lines:
+        return []
+
+    # Первая строка - header с ```lang
+    header = lines[0]
+
+    # Ищем последнюю строку, начинающуюся с ```
+    footer_idx = None
+    for idx in range(len(lines) - 1, -1, -1):
+        if lines[idx].lstrip().startswith("```"):
+            footer_idx = idx
+            break
+
+    if footer_idx is None:
+        body_lines = lines[1:]
+        footer = ""
+    else:
+        body_lines = lines[1:footer_idx]
+        footer = lines[footer_idx]
+
+    header_len = len(header)
+    footer_len = len(footer)
+    max_body = max(1, limit - header_len - footer_len)
+
+    body_text = "".join(body_lines)
     chunks: List[str] = []
-    current = text
 
-    while len(current) > limit:
-        split_pos = current.rfind("\n", 0, limit)
-        if split_pos == -1:
-            split_pos = current.rfind(" ", 0, limit)
-        if split_pos == -1:
-            split_pos = limit
+    rest = body_text
+    while rest:
+        if len(rest) <= max_body:
+            part = rest
+            rest = ""
+        else:
+            split_at = _smart_split_point_code(rest, max_body)
+            part = rest[:split_at]
+            rest = rest[split_at:]
 
-        chunks.append(current[:split_pos].rstrip())
-        current = current[split_pos:].lstrip()
-
-    if current:
-        chunks.append(current)
+        chunks.append(header + part + footer)
 
     return chunks
+
+
+def _detach_last_bold_line(text: str) -> (str, str):
+    """
+    Ищет последнюю "жирную" строку вида *Заголовок*,
+    возвращает кортеж (prefix, bold_tail), где:
+
+      text = prefix + bold_tail
+
+    Если жирной строки нет - bold_tail == "".
+    """
+    lines = text.splitlines(keepends=True)
+    for idx in range(len(lines) - 1, -1, -1):
+        line = lines[idx]
+        if BOLD_LINE_RE.match(line.strip()):
+            prefix = "".join(lines[:idx])
+            bold_tail = "".join(lines[idx:])
+            return prefix, bold_tail
+    return text, ""
+
+
+def _append_text_block(
+    chunks: List[str],
+    current: str,
+    block_text: str,
+    limit: int,
+) -> (List[str], str):
+    """
+    Добавляет текстовый блок в текущий chunk с учётом лимита.
+    Если блок не помещается, режет его по _smart_split_point().
+    """
+    text = block_text
+
+    while text:
+        remaining = limit - len(current)
+        if remaining <= 0:
+            # Текущий chunk заполнен - отправляем и начинаем новый
+            if current.strip():
+                chunks.append(current.rstrip())
+            current = ""
+            remaining = limit
+
+        # всё целиком помещается
+        if len(text) <= remaining:
+            current += text
+            break
+
+        # нужно разделить внутри блока
+        split_at = _smart_split_point(text, remaining)
+        # защита от зацикливания
+        if split_at <= 0:
+            # ничего не помещается - вынужденно режем жёстко
+            split_at = remaining
+
+        current += text[:split_at]
+        if current.strip():
+            chunks.append(current.rstrip())
+        current = ""
+        text = text[split_at:].lstrip()
+
+    return chunks, current
+
+
+def _append_code_block(
+    chunks: List[str],
+    current: str,
+    block_text: str,
+    limit: int,
+) -> (List[str], str):
+    """
+    Добавляет кодовый блок в разбиение с учётом правил:
+      - если блок не помещается в остаток текущего сообщения,
+        переносим его в новое сообщение;
+      - при переносе ищем предшествующую строку вида *Заголовок* и
+        переносим её вместе с блоком в новое сообщение;
+      - если сам кодовый блок > limit, делим его на несколько самостоятельных
+        код-блоков (см. _split_long_code_block).
+    """
+    # Блок сам по себе длиннее лимита -> делим его на несколько
+    if len(block_text) > limit:
+        bold_tail = ""
+        if current:
+            prefix, bold_tail = _detach_last_bold_line(current)
+            if prefix.strip():
+                chunks.append(prefix.rstrip())
+            current = ""  # оставляем только возможный bold_tail для использования ниже
+
+        pieces = _split_long_code_block(block_text, limit)
+        first = True
+        for piece in pieces:
+            piece = piece.rstrip()
+            if first and bold_tail:
+                merged = bold_tail + piece
+                if len(merged) <= limit:
+                    chunks.append(merged.rstrip())
+                else:
+                    # не поместился вместе - отправляем заголовок отдельно
+                    chunks.append(bold_tail.rstrip())
+                    chunks.append(piece)
+                bold_tail = ""
+                first = False
+            else:
+                chunks.append(piece)
+        return chunks, current
+
+    # Блок умещается в одно сообщение
+    if len(current) + len(block_text) <= limit:
+        # просто добавляем к текущему
+        current += block_text
+        return chunks, current
+
+    # Блок не помещается в остаток текущего сообщения -> новый chunk
+    bold_tail = ""
+    if current:
+        prefix, bold_tail = _detach_last_bold_line(current)
+        if prefix.strip():
+            chunks.append(prefix.rstrip())
+        # bold_tail пойдёт в новое сообщение вместе с кодом
+        current = ""
+
+    new_chunk = (bold_tail + block_text).rstrip()
+    chunks.append(new_chunk)
+    return chunks, ""
+
+
+def _split_section(section: str, limit: int) -> List[str]:
+    """
+    Сплитит одну «логическую секцию» (между ---/***/___) на сообщения.
+    """
+    blocks = _parse_blocks(section)
+    chunks: List[str] = []
+    current = ""
+
+    for blk in blocks:
+        if blk["type"] == "text":
+            chunks, current = _append_text_block(chunks, current, blk["text"], limit)
+        else:
+            chunks, current = _append_code_block(chunks, current, blk["text"], limit)
+
+    if current.strip():
+        chunks.append(current.rstrip())
+
+    return chunks
+
+
+def split_md_v2(text: str, limit: int = MAX_TELEGRAM_MESSAGE_LEN) -> List[str]:
+    """
+    Разбивает итоговый Telegram.MarkdownV2-текст на части, каждая из которых
+    укладывается в лимит Telegram по длине.
+
+    Правила:
+      1. Строки из `---`, `***`, `___` (окружённые переводами строк) делят текст
+         на независимые секции.
+      2. При достижении лимита текста внутри секции:
+         - текст режется по "красивым" позициям (_smart_split_point);
+         - кодовые блоки либо целиком переносятся в новое сообщение
+           вместе с предшествующим жирным заголовком (*Заголовок*),
+           либо делятся на несколько самостоятельных код-блоков,
+           если они сами превышают лимит.
+      3. В конце все сообщения `strip()`-ятся; пустые/пробельные отбрасываются.
+    """
+    # Сначала делим на секции по горизонтальным разделителям
+    sections = _split_on_horizontal_rules(text)
+
+    all_chunks: List[str] = []
+    for sec in sections:
+        if not sec.strip():
+            continue
+        all_chunks.extend(_split_section(sec, limit))
+
+    # Финальная очистка: убираем пробелы по краям и пустые сообщения
+    result: List[str] = []
+    for ch in all_chunks:
+        cleaned = ch.strip()
+        if cleaned:
+            result.append(cleaned)
+
+    return result
