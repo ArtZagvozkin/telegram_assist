@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from telegram import Update
+from telegram import Update, Message
+from telegram.constants import ParseMode
 from telegram.ext import (
     CommandHandler,
     MessageHandler,
@@ -10,7 +11,7 @@ from telegram.ext import (
 
 from config import SYSTEM_PROMPT, logger
 from storage.base import BaseContextStore
-from telegram_bot.utils import split_message
+from telegram_bot.utils import convert_to_md_v2, split_md_v2
 from telegram_bot.message_adapter import parse_message, to_chat_message
 from llm.base import (
     LLMClient,
@@ -20,10 +21,19 @@ from llm.base import (
 )
 
 
+async def send_reply(message: Message, text: str) -> None:
+    text = convert_to_md_v2(text)
+    for chunk in split_md_v2(text):
+        await message.reply_text(
+            chunk,
+            parse_mode=ParseMode.MARKDOWN_V2
+        )
+
+
 def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
     """
-    Фабрика хендлеров. Внутренние функции-обработчики видят llm_client и context_store
-    через замыкание.
+    Фабрика хендлеров.
+    Внутренние функции-обработчики видят llm_client и context_store через замыкание.
     """
 
     async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -55,7 +65,7 @@ def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
         user_id = user.id
         logger.info("User id: %s", user_id)
 
-        # 1. Парсим входящее сообщение
+        # Парсим входящее сообщение
         parsed = await parse_message(message)
         user_message = to_chat_message(parsed)
 
@@ -66,7 +76,7 @@ def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
             )
             return
 
-        # 2. Работа с контекстом
+        # Работа с контекстом
         context_store.append_message(user_id, user_message)
         history = context_store.get_history(user_id)
 
@@ -74,7 +84,7 @@ def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
             {"role": "system", "content": SYSTEM_PROMPT}
         ] + history
 
-        # 3. Запрос к LLM
+        # Запрос к LLM
         try:
             assistant_response = await llm_client.generate(messages_for_llm)
             if not assistant_response:
@@ -82,15 +92,13 @@ def create_handlers(llm_client: LLMClient, context_store: BaseContextStore):
                 await message.reply_text("Не смог получить ответ от модели 😔")
                 return
 
-            # 4. Сохраняем ответ ассистента в контекст
+            # Сохраняем ответ ассистента в контекст
             context_store.append_message(
                 user_id,
                 {"role": "assistant", "content": assistant_response},
             )
 
-            # 5. Режем длинный ответ на части
-            for chunk in split_message(assistant_response):
-                await message.reply_text(chunk)
+            await send_reply(message, assistant_response)
 
         except LLMQuotaExceededError:
             logger.warning("LLM quota exceeded (Gemini 429) for user %s", user_id)
