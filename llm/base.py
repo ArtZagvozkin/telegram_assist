@@ -29,7 +29,7 @@ class ChatMessage(TypedDict, total=False):
 
 
 class LLMClient(ABC):
-    """Абстрактный клиент LLM - чтобы легко добавить других провайдеров."""
+    """Абстрактный клиент LLM."""
 
     @abstractmethod
     async def generate(self, messages: list[ChatMessage]) -> Optional[str]:
@@ -42,3 +42,16 @@ class LLMClient(ABC):
         }
         """
         raise NotImplementedError
+
+
+class LLMError(Exception):
+    """Базовая ошибка для всех проблем."""
+
+
+class LLMQuotaExceededError(LLMError):
+    """ Превышен лимит использования модели (квота/тариф)."""
+
+
+class LLMOverloadedError(LLMError):
+    """Модель перегружена или временно недоступна."""
+
