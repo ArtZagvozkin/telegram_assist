@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 
 from telegram.ext import ApplicationBuilder
+from telegram_bot.handlers import create_handlers
 
 from config import TELEGRAM_TOKEN, MAX_HISTORY, LLM_PROVIDER, logger
 from llm.gemini_client import GeminiClient
 from storage.memory import MemoryContextStore
-from telegram_bot.handlers import create_handlers
 
 
 def build_llm_client():
